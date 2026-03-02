@@ -7,6 +7,24 @@ import { createOpencodeClient } from '@opencode-ai/sdk';
 const app = express();
 const TARGET_PORT = 4097;
 
+// Configuration from environment variables
+const CONFIG = {
+    includeThinking: process.env.INCLUDE_THINKING === 'true',
+    maxConcurrentRequests: parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10,
+    defaultProvider: process.env.DEFAULT_PROVIDER || 'opencode',
+    defaultModel: process.env.DEFAULT_MODEL || 'big-pickle'
+};
+
+// Concurrency management
+let currentRequests = 0;
+const requestQueue = [];
+
+console.log('Configuration loaded:', {
+    includeThinking: CONFIG.includeThinking,
+    maxConcurrentRequests: CONFIG.maxConcurrentRequests,
+    defaultModel: `${CONFIG.defaultProvider}/${CONFIG.defaultModel}`
+});
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
@@ -49,6 +67,103 @@ function getClient() {
 
     return createOpencodeClient({ baseUrl, headers });
 }
+
+/**
+ * Calculates token usage based on text length.
+ * Uses a simple heuristic: 1 token ≈ 4 characters.
+ * 
+ * @param {string} text The text to calculate tokens for
+ * @returns {number} Estimated token count
+ */
+function calculateTokens(text) {
+    return Math.ceil(text.length / 4);
+}
+
+/**
+ * Calculates usage statistics for the response.
+ * 
+ * @param {string} promptText The full prompt text
+ * @param {string} content The response content
+ * @param {string} reasoningContent The reasoning content (if any)
+ * @returns {object} Usage statistics
+ */
+function calculateUsage(promptText, content, reasoningContent = '') {
+    const promptTokens = calculateTokens(promptText);
+    const completionTokens = calculateTokens(content);
+    const reasoningTokens = calculateTokens(reasoningContent);
+
+    return {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens + reasoningTokens,
+        total_tokens: promptTokens + completionTokens + reasoningTokens,
+        completion_tokens_details: {
+            reasoning_tokens: reasoningTokens
+        }
+    };
+}
+
+// Concurrency Middleware
+app.use((req, res, next) => {
+    // Skip concurrency check for health endpoint
+    if (req.path === '/health') {
+        return next();
+    }
+
+    if (currentRequests >= CONFIG.maxConcurrentRequests) {
+        const queuePosition = requestQueue.length + 1;
+        console.log(`Request queued. Position: ${queuePosition}`);
+        
+        // For streaming requests, send queue notification
+        if (req.body && req.body.stream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Queue-Position', queuePosition);
+            
+            res.write(`data: ${JSON.stringify({
+                type: 'queue',
+                position: queuePosition,
+                message: `Request queued. You are #${queuePosition} in line.`
+            })}\n\n`);
+        } else {
+            // For non-streaming requests, add header with queue position
+            res.setHeader('X-Queue-Position', queuePosition);
+        }
+
+        // Add to queue
+        requestQueue.push({ req, res, next });
+        return;
+    }
+
+    currentRequests++;
+    console.log(`Request started. Active: ${currentRequests}/${CONFIG.maxConcurrentRequests}`);
+
+    // Cleanup on response finish
+    res.on('finish', () => {
+        currentRequests--;
+        console.log(`Request completed. Active: ${currentRequests}/${CONFIG.maxConcurrentRequests}`);
+        
+        // Process next request in queue
+        if (requestQueue.length > 0) {
+            const nextRequest = requestQueue.shift();
+            currentRequests++;
+            console.log(`Processing queued request. Active: ${currentRequests}/${CONFIG.maxConcurrentRequests}`);
+            
+            // Notify that request is being processed
+            if (nextRequest.req.body && nextRequest.req.body.stream) {
+                nextRequest.res.write(`data: ${JSON.stringify({
+                    type: 'queue',
+                    position: 0,
+                    message: 'Request is now being processed.'
+                })}\n\n`);
+            }
+            
+            nextRequest.next();
+        }
+    });
+
+    next();
+});
 
 // Auth Middleware
 app.use((req, res, next) => {
@@ -128,13 +243,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (model && model.includes('/')) {
             [providerId, modelId] = model.split('/');
         } else {
-            providerId = 'opencode';
-            modelId = 'big-pickle';
+            providerId = CONFIG.defaultProvider;
+            modelId = CONFIG.defaultModel;
         }
 
         const client = getClient();
 
-        console.log(`Using model: ${providerId}/${modelId}${stream ? ' (streaming)' : ''}`);
+        console.log(`Using model: ${providerId}/${modelId}${stream ? ' (streaming)' : ''}${CONFIG.includeThinking ? ' (with thinking)' : ''}`);
 
         // Process messages to OpenCode Parts
         const allParts = [];
@@ -205,7 +320,6 @@ app.post('/v1/chat/completions', async (req, res) => {
              let completionTokens = 0;
              let reasoningTokens = 0;
              let insideReasoning = false;
-             let hasStartedStreaming = false;
 
              try {
                  // 3. Send prompt (don't await - fire and forget)
@@ -249,56 +363,65 @@ app.post('/v1/chat/completions', async (req, res) => {
                          // Handle reasoning parts
                          if (part.type === 'reasoning') {
                              if (!insideReasoning) {
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: '<think>\n' },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
                                  insideReasoning = true;
-                                 hasStartedStreaming = true;
+                                 
+                                 // Output thinking tag if enabled
+                                 if (CONFIG.includeThinking) {
+                                     res.write(`data: ${JSON.stringify({
+                                         id,
+                                         object: 'chat.completion.chunk',
+                                         created: Math.floor(Date.now() / 1000),
+                                         model: `${providerId}/${modelId}`,
+                                         choices: [{
+                                             index: 0,
+                                             delta: { content: '<think\>\n' },
+                                             finish_reason: null
+                                         }]
+                                     })}\n\n`);
+                                 }
                              }
 
                              if (delta) {
-                                 reasoningTokens += Math.ceil(delta.length / 4);
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: delta },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
+                                 reasoningTokens += calculateTokens(delta);
+                                 
+                                 // Output reasoning content if enabled
+                                 if (CONFIG.includeThinking) {
+                                     res.write(`data: ${JSON.stringify({
+                                         id,
+                                         object: 'chat.completion.chunk',
+                                         created: Math.floor(Date.now() / 1000),
+                                         model: `${providerId}/${modelId}`,
+                                         choices: [{
+                                             index: 0,
+                                             delta: { content: delta },
+                                             finish_reason: null
+                                         }]
+                                     })}\n\n`);
+                                 }
                              }
                          }
                          // Handle text parts
                          else if (part.type === 'text') {
                              // Close reasoning tag if we were inside it
                              if (insideReasoning) {
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: '\n</think>\n\n' },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
+                                 if (CONFIG.includeThinking) {
+                                     res.write(`data: ${JSON.stringify({
+                                         id,
+                                         object: 'chat.completion.chunk',
+                                         created: Math.floor(Date.now() / 1000),
+                                         model: `${providerId}/${modelId}`,
+                                         choices: [{
+                                             index: 0,
+                                             delta: { content: '\n</think\>\n\n' },
+                                             finish_reason: null
+                                         }]
+                                     })}\n\n`);
+                                 }
                                  insideReasoning = false;
                              }
 
                              if (delta) {
-                                 completionTokens += Math.ceil(delta.length / 4);
+                                 completionTokens += calculateTokens(delta);
                                  res.write(`data: ${JSON.stringify({
                                      id,
                                      object: 'chat.completion.chunk',
@@ -310,7 +433,6 @@ app.post('/v1/chat/completions', async (req, res) => {
                                          finish_reason: null
                                      }]
                                  })}\n\n`);
-                                 hasStartedStreaming = true;
                              }
                          }
                      }
@@ -321,7 +443,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                          
                          if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                              // Close reasoning tag if still open
-                             if (insideReasoning) {
+                             if (insideReasoning && CONFIG.includeThinking) {
                                  res.write(`data: ${JSON.stringify({
                                      id,
                                      object: 'chat.completion.chunk',
@@ -329,22 +451,17 @@ app.post('/v1/chat/completions', async (req, res) => {
                                      model: `${providerId}/${modelId}`,
                                      choices: [{
                                          index: 0,
-                                         delta: { content: '\n</think>\n\n' },
+                                         delta: { content: '\n</think\>\n\n' },
                                          finish_reason: null
                                      }]
                                  })}\n\n`);
                              }
 
                              // Calculate usage
-                             const promptTokens = Math.ceil(fullPromptText.length / 4);
-                             const usage = {
-                                 prompt_tokens: promptTokens,
-                                 completion_tokens: completionTokens + reasoningTokens,
-                                 total_tokens: promptTokens + completionTokens + reasoningTokens,
-                                 completion_tokens_details: {
-                                     reasoning_tokens: reasoningTokens
-                                 }
-                             };
+                             const usage = calculateUsage(fullPromptText, '', '');
+                             usage.completion_tokens = completionTokens + reasoningTokens;
+                             usage.total_tokens = usage.prompt_tokens + completionTokens + reasoningTokens;
+                             usage.completion_tokens_details.reasoning_tokens = reasoningTokens;
 
                              res.write(`data: ${JSON.stringify({
                                  id,
@@ -420,24 +537,12 @@ app.post('/v1/chat/completions', async (req, res) => {
              }
              
              // Calculate usage
-             const promptTokens = fullPromptText.length / 4; 
-             const completionTokens = content.length / 4;
-             const reasoningTokens = reasoningContent.length / 4;
-             const totalTokens = promptTokens + completionTokens + reasoningTokens;
+             const usage = calculateUsage(fullPromptText, content, reasoningContent);
 
-             const usage = {
-                 prompt_tokens: Math.ceil(promptTokens),
-                 completion_tokens: Math.ceil(completionTokens + reasoningTokens),
-                 total_tokens: Math.ceil(totalTokens),
-                 completion_tokens_details: {
-                     reasoning_tokens: Math.ceil(reasoningTokens)
-                 }
-             };
-
-             // Combine reasoning into content for non-streaming
+             // Combine content based on configuration
              let finalContent = content;
-             if (reasoningContent) {
-                 finalContent = `<think>\n${reasoningContent}\n</think>\n\n${content}`;
+             if (CONFIG.includeThinking && reasoningContent) {
+                 finalContent = '<think\>\n' + reasoningContent + '\n</think\>\n\n' + content;
              }
 
              const result = {
@@ -471,7 +576,17 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', proxy: true });
+    res.json({ 
+        status: 'ok', 
+        proxy: true,
+        activeRequests: currentRequests,
+        maxConcurrentRequests: CONFIG.maxConcurrentRequests,
+        queuedRequests: requestQueue.length,
+        config: {
+            includeThinking: CONFIG.includeThinking,
+            defaultModel: `${CONFIG.defaultProvider}/${CONFIG.defaultModel}`
+        }
+    });
 });
 
 export default app;
