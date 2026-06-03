@@ -11,8 +11,8 @@ jest.unstable_mockModule('axios', () => ({
     }
 }));
 
-jest.unstable_mockModule('@opencode-ai/sdk', () => ({
-    createOpencodeClient: jest.fn(() => ({
+jest.unstable_mockModule('@opencode-ai/sdk', () => {
+    const client = {
         config: {
             providers: jest.fn(async () => ({
                 data: {
@@ -35,11 +35,11 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             prompt: jest.fn(async (args) => {
                 const promptText = args.body.prompt || '';
                 const parts = [{ type: 'text', text: 'Resposta simulada' }];
-                
+
                 if (promptText.includes('reasoning')) {
                     parts.unshift({ type: 'reasoning', text: 'Thinking process...' });
                 }
-                
+
                 return {
                     data: { parts }
                 };
@@ -64,8 +64,10 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
                 };
             })
         }
-    }))
-}));
+    };
+    return { createOpencodeClient: jest.fn(() => client) };
+});
+
 
 const { default: app } = await import('../app.js');
 const { createOpencodeClient } = await import('@opencode-ai/sdk');
