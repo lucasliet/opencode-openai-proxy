@@ -180,8 +180,11 @@ describe('Proxy OpenAI API', () => {
 
         client.event.subscribe.mockImplementationOnce(async () => ({
             stream: (async function* () {
-                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } };
-                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Resposta' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'The user is asking' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: ' a simple math question' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: '. The answer is 2.' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: '1+1' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: ' = 2' } };
                 yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: null } };
                 yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: undefined } };
                 yield { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } };
@@ -193,7 +196,7 @@ describe('Proxy OpenAI API', () => {
             .set('Authorization', 'Bearer test-password')
             .send({
                 model: 'opencode/gpt-5-nano',
-                messages: [{ role: 'user', content: 'Olá' }],
+                messages: [{ role: 'user', content: '1+1=?' }],
                 stream: true
             });
 
@@ -204,6 +207,7 @@ describe('Proxy OpenAI API', () => {
         expect(thinkOpenCount).toEqual(1);
         expect(thinkCloseCount).toEqual(1);
     });
+
 
     test('POST /v1/chat/completions deve retornar tokens de reasoning quando disponiveis (non-streaming)', async () => {
         const res = await request(app)
