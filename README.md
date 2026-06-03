@@ -7,7 +7,6 @@ This Docker image provides a complete and optimized environment to run the [Open
 - **OpenAI Compatibility Proxy:** Use OpenCode as if it were the OpenAI service. Compatible with LibreChat, Dify, TypingMind, etc.
 - **Streaming Support:** Real-time responses via Server-Sent Events (SSE).
 - **Dynamic Model Mapping:** Automatic support for multiple providers in `provider/model` format.
-- **Thinking Content Filter:** Configurable filtering of AI reasoning/thinking content (default: hidden).
 - **Native API Exposed:** Full access to OpenCode's original features and web interface.
 - **Secure by Default:** Authentication via Bearer Token for the Proxy and Basic Auth for the native API.
 - **Data Persistence:** Volumes configured to keep sessions, database, and settings.
@@ -25,11 +24,6 @@ Use the provided [`docker-compose.yml`](./docker-compose.yml) to spin up the ser
    ```env
    # Required
    OPENCODE_SERVER_PASSWORD=your_secret_password
-   
-   # Optional - Feature Configuration
-   INCLUDE_THINKING=false                    # Show AI thinking content (default: false)
-   DEFAULT_PROVIDER=opencode                 # Default provider (default: opencode)
-   DEFAULT_MODEL=big-pickle                  # Default model (default: big-pickle)
    ```
 
 2. Start the container:
@@ -45,9 +39,6 @@ docker run -d \
   -p 4096:4096 \
   -p 4097:4097 \
   -e OPENCODE_SERVER_PASSWORD=your_secret_password \
-  -e INCLUDE_THINKING=false \
-  -e DEFAULT_PROVIDER=opencode \
-  -e DEFAULT_MODEL=big-pickle \
   -e PUID=1000 \
   -e PGID=1000 \
   -v opencode_data:/home/node/.local/share/opencode \
@@ -97,35 +88,10 @@ Simply add `"stream": true` to the payload and the proxy will send data word by 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENCODE_SERVER_PASSWORD` | - | **Required.** Password for authentication |
-| `INCLUDE_THINKING` | `false` | Include AI reasoning/thinking content in responses |
-| `DEFAULT_PROVIDER` | `opencode` | Default provider when model format is not `provider/model` |
-| `DEFAULT_MODEL` | `big-pickle` | Default model when model format is not `provider/model` |
 | `PUID` | - | User ID for file permissions (NAS compatibility) |
 | `PGID` | - | Group ID for file permissions (NAS compatibility) |
 
-### Thinking Content Filter
 
-By default, the proxy filters out AI reasoning/thinking content (content wrapped in `<think\>` tags) to provide cleaner responses.
-
-**To enable thinking content:**
-```bash
-INCLUDE_THINKING=true
-```
-
-**Example response with thinking enabled:**
-```
-<think\>
-Let me analyze this question step by step...
-First, I need to consider...
-</think\>
-
-Here's my actual response to your question...
-```
-
-**Example response with thinking disabled (default):**
-```
-Here's my actual response to your question...
-```
 
 
 
@@ -143,17 +109,12 @@ curl http://localhost:4096/health
 ```json
 {
   "status": "ok",
-  "proxy": true,
-  "config": {
-    "includeThinking": false,
-    "defaultModel": "opencode/big-pickle"
-  }
+  "proxy": true
 }
 ```
 
 This endpoint is useful for:
 - Load balancer health checks
-- Verifying configuration
 
 ---
 

@@ -7,17 +7,7 @@ import { createOpencodeClient } from '@opencode-ai/sdk';
 const app = express();
 const TARGET_PORT = 4097;
 
-// Configuration from environment variables
-const CONFIG = {
-    includeThinking: process.env.INCLUDE_THINKING === 'true',
-    defaultProvider: process.env.DEFAULT_PROVIDER || 'opencode',
-    defaultModel: process.env.DEFAULT_MODEL || 'big-pickle'
-};
 
-console.log('Configuration loaded:', {
-    includeThinking: CONFIG.includeThinking,
-    defaultModel: `${CONFIG.defaultProvider}/${CONFIG.defaultModel}`
-});
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -176,13 +166,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (model && model.includes('/')) {
             [providerId, modelId] = model.split('/');
         } else {
-            providerId = CONFIG.defaultProvider;
-            modelId = CONFIG.defaultModel;
+            providerId = 'opencode';
+            modelId = 'big-pickle';
         }
 
         const client = getClient();
 
-        console.log(`Using model: ${providerId}/${modelId}${stream ? ' (streaming)' : ''}${CONFIG.includeThinking ? ' (with thinking)' : ''}`);
+        console.log(`Using model: ${providerId}/${modelId}${stream ? ' (streaming)' : ''}`);
 
         // Process messages to OpenCode Parts
         const allParts = [];
@@ -298,58 +288,50 @@ app.post('/v1/chat/completions', async (req, res) => {
                              if (!insideReasoning) {
                                  insideReasoning = true;
                                  
-                                 // Output thinking tag if enabled
-                                 if (CONFIG.includeThinking) {
-                                     res.write(`data: ${JSON.stringify({
-                                         id,
-                                         object: 'chat.completion.chunk',
-                                         created: Math.floor(Date.now() / 1000),
-                                         model: `${providerId}/${modelId}`,
-                                         choices: [{
-                                             index: 0,
-                                             delta: { content: '<think\>\n' },
-                                             finish_reason: null
-                                         }]
-                                     })}\n\n`);
-                                 }
+                                 res.write(`data: ${JSON.stringify({
+                                     id,
+                                     object: 'chat.completion.chunk',
+                                     created: Math.floor(Date.now() / 1000),
+                                     model: `${providerId}/${modelId}`,
+                                     choices: [{
+                                         index: 0,
+                                         delta: { content: '<think>\n' },
+                                         finish_reason: null
+                                     }]
+                                 })}\n\n`);
                              }
 
                              if (delta) {
                                  reasoningTokens += calculateTokens(delta);
                                  
-                                 // Output reasoning content if enabled
-                                 if (CONFIG.includeThinking) {
-                                     res.write(`data: ${JSON.stringify({
-                                         id,
-                                         object: 'chat.completion.chunk',
-                                         created: Math.floor(Date.now() / 1000),
-                                         model: `${providerId}/${modelId}`,
-                                         choices: [{
-                                             index: 0,
-                                             delta: { content: delta },
-                                             finish_reason: null
-                                         }]
-                                     })}\n\n`);
-                                 }
+                                 res.write(`data: ${JSON.stringify({
+                                     id,
+                                     object: 'chat.completion.chunk',
+                                     created: Math.floor(Date.now() / 1000),
+                                     model: `${providerId}/${modelId}`,
+                                     choices: [{
+                                         index: 0,
+                                         delta: { content: delta },
+                                         finish_reason: null
+                                     }]
+                                 })}\n\n`);
                              }
                          }
                          // Handle text parts
                          else if (part.type === 'text') {
                              // Close reasoning tag if we were inside it
                              if (insideReasoning) {
-                                 if (CONFIG.includeThinking) {
-                                     res.write(`data: ${JSON.stringify({
-                                         id,
-                                         object: 'chat.completion.chunk',
-                                         created: Math.floor(Date.now() / 1000),
-                                         model: `${providerId}/${modelId}`,
-                                         choices: [{
-                                             index: 0,
-                                             delta: { content: '\n</think\>\n\n' },
-                                             finish_reason: null
-                                         }]
-                                     })}\n\n`);
-                                 }
+                                 res.write(`data: ${JSON.stringify({
+                                     id,
+                                     object: 'chat.completion.chunk',
+                                     created: Math.floor(Date.now() / 1000),
+                                     model: `${providerId}/${modelId}`,
+                                     choices: [{
+                                         index: 0,
+                                         delta: { content: '\n</think>\n\n' },
+                                         finish_reason: null
+                                     }]
+                                 })}\n\n`);
                                  insideReasoning = false;
                              }
 
@@ -376,7 +358,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                          
                          if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                              // Close reasoning tag if still open
-                             if (insideReasoning && CONFIG.includeThinking) {
+                             if (insideReasoning) {
                                  res.write(`data: ${JSON.stringify({
                                      id,
                                      object: 'chat.completion.chunk',
@@ -384,7 +366,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                                      model: `${providerId}/${modelId}`,
                                      choices: [{
                                          index: 0,
-                                         delta: { content: '\n</think\>\n\n' },
+                                         delta: { content: '\n</think>\n\n' },
                                          finish_reason: null
                                      }]
                                  })}\n\n`);
@@ -474,8 +456,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 
              // Combine content based on configuration
              let finalContent = content;
-             if (CONFIG.includeThinking && reasoningContent) {
-                 finalContent = '<think\>\n' + reasoningContent + '\n</think\>\n\n' + content;
+             if (reasoningContent) {
+                 finalContent = '<think>\n' + reasoningContent + '\n</think>\n\n' + content;
              }
 
              const result = {
@@ -511,11 +493,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
-        proxy: true,
-        config: {
-            includeThinking: CONFIG.includeThinking,
-            defaultModel: `${CONFIG.defaultProvider}/${CONFIG.defaultModel}`
-        }
+        proxy: true
     });
 });
 
