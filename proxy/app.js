@@ -248,23 +248,23 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                          // Handle reasoning parts
                          if (part.type === 'reasoning') {
-                             if (!insideReasoning) {
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: '<think>\n' },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                                 insideReasoning = true;
-                                 hasStartedStreaming = true;
-                             }
-
                              if (delta) {
+                                 if (!insideReasoning) {
+                                     res.write(`data: ${JSON.stringify({
+                                         id,
+                                         object: 'chat.completion.chunk',
+                                         created: Math.floor(Date.now() / 1000),
+                                         model: `${providerId}/${modelId}`,
+                                         choices: [{
+                                             index: 0,
+                                             delta: { content: '<think>\n' },
+                                             finish_reason: null
+                                         }]
+                                     })}\n\n`);
+                                     insideReasoning = true;
+                                     hasStartedStreaming = true;
+                                 }
+
                                  reasoningTokens += Math.ceil(delta.length / 4);
                                  res.write(`data: ${JSON.stringify({
                                      id,

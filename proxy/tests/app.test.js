@@ -67,8 +67,8 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     }))
 }));
 
-// Importa o app dinamicamente para que o mock seja aplicado
 const { default: app } = await import('../app.js');
+const { createOpencodeClient } = await import('@opencode-ai/sdk');
 
 describe('Proxy OpenAI API', () => {
     const originalEnv = process.env;
@@ -172,6 +172,37 @@ describe('Proxy OpenAI API', () => {
 
         expect(res.statusCode).toEqual(200);
         expect(res.body.choices[0].message.content).toEqual('Resposta simulada');
+    });
+
+    test('POST /v1/chat/completions não deve gerar tags think vazias quando reasoning não tem conteúdo (issue #1)', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Thinking...' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'text', sessionID: sessionId }, delta: 'Resposta' } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: null } };
+                yield { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: undefined } };
+                yield { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/gpt-5-nano',
+                messages: [{ role: 'user', content: 'Olá' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+
+        const thinkOpenCount = (res.text.match(/<think>/g) || []).length;
+        const thinkCloseCount = (res.text.match(/<\/think>/g) || []).length;
+        expect(thinkOpenCount).toEqual(1);
+        expect(thinkCloseCount).toEqual(1);
     });
 
     test('POST /v1/chat/completions deve retornar tokens de reasoning quando disponiveis (non-streaming)', async () => {
