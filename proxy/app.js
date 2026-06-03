@@ -10,18 +10,12 @@ const TARGET_PORT = 4097;
 // Configuration from environment variables
 const CONFIG = {
     includeThinking: process.env.INCLUDE_THINKING === 'true',
-    maxConcurrentRequests: parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10,
     defaultProvider: process.env.DEFAULT_PROVIDER || 'opencode',
     defaultModel: process.env.DEFAULT_MODEL || 'big-pickle'
 };
 
-// Concurrency management
-let currentRequests = 0;
-const requestQueue = [];
-
 console.log('Configuration loaded:', {
     includeThinking: CONFIG.includeThinking,
-    maxConcurrentRequests: CONFIG.maxConcurrentRequests,
     defaultModel: `${CONFIG.defaultProvider}/${CONFIG.defaultModel}`
 });
 
@@ -102,68 +96,7 @@ function calculateUsage(promptText, content, reasoningContent = '') {
     };
 }
 
-// Concurrency Middleware
-app.use((req, res, next) => {
-    // Skip concurrency check for health endpoint
-    if (req.path === '/health') {
-        return next();
-    }
 
-    if (currentRequests >= CONFIG.maxConcurrentRequests) {
-        const queuePosition = requestQueue.length + 1;
-        console.log(`Request queued. Position: ${queuePosition}`);
-        
-        // For streaming requests, send queue notification
-        if (req.body && req.body.stream) {
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-            res.setHeader('X-Queue-Position', queuePosition);
-            
-            res.write(`data: ${JSON.stringify({
-                type: 'queue',
-                position: queuePosition,
-                message: `Request queued. You are #${queuePosition} in line.`
-            })}\n\n`);
-        } else {
-            // For non-streaming requests, add header with queue position
-            res.setHeader('X-Queue-Position', queuePosition);
-        }
-
-        // Add to queue
-        requestQueue.push({ req, res, next });
-        return;
-    }
-
-    currentRequests++;
-    console.log(`Request started. Active: ${currentRequests}/${CONFIG.maxConcurrentRequests}`);
-
-    // Cleanup on response finish
-    res.on('finish', () => {
-        currentRequests--;
-        console.log(`Request completed. Active: ${currentRequests}/${CONFIG.maxConcurrentRequests}`);
-        
-        // Process next request in queue
-        if (requestQueue.length > 0) {
-            const nextRequest = requestQueue.shift();
-            currentRequests++;
-            console.log(`Processing queued request. Active: ${currentRequests}/${CONFIG.maxConcurrentRequests}`);
-            
-            // Notify that request is being processed
-            if (nextRequest.req.body && nextRequest.req.body.stream) {
-                nextRequest.res.write(`data: ${JSON.stringify({
-                    type: 'queue',
-                    position: 0,
-                    message: 'Request is now being processed.'
-                })}\n\n`);
-            }
-            
-            nextRequest.next();
-        }
-    });
-
-    next();
-});
 
 // Auth Middleware
 app.use((req, res, next) => {
@@ -579,9 +512,6 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         proxy: true,
-        activeRequests: currentRequests,
-        maxConcurrentRequests: CONFIG.maxConcurrentRequests,
-        queuedRequests: requestQueue.length,
         config: {
             includeThinking: CONFIG.includeThinking,
             defaultModel: `${CONFIG.defaultProvider}/${CONFIG.defaultModel}`
