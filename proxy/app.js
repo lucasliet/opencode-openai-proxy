@@ -370,6 +370,8 @@ app.post('/v1/chat/completions', async (req, res) => {
              let reasoningTokens = 0;
              let insideReasoning = false;
              let hasStartedStreaming = false;
+             const partTextMap = new Map();
+             let userMessageId = null;
 
              try {
                  // 3. Send prompt (don't await - fire and forget)
@@ -405,10 +407,17 @@ app.post('/v1/chat/completions', async (req, res) => {
                      
                      // Filter for our session
                      if (eventData.type === 'message.part.updated') {
-                         const { part, delta } = eventData.properties;
+                         const { part } = eventData.properties;
                          
-                         // Skip if not our session
-                         if (part.sessionID !== sessionId) continue;
+                         // Skip if not our session or if this is the user's own echoed part
+                         if (part.sessionID !== sessionId || part.messageID === userMessageId) continue;
+
+                         // Server sends cumulative part.text; diff against last seen text per part
+                         const hasFullText = part.text !== undefined;
+                         const delta = hasFullText
+                             ? part.text.slice((partTextMap.get(part.id) || '').length)
+                             : (eventData.properties.delta || '');
+                         if (hasFullText) partTextMap.set(part.id, part.text || '');
 
                          // Handle reasoning parts
                          if (part.type === 'reasoning') {
@@ -483,6 +492,10 @@ app.post('/v1/chat/completions', async (req, res) => {
                      if (eventData.type === 'message.updated') {
                          const messageInfo = eventData.properties?.info;
                          
+                         if (messageInfo?.sessionID === sessionId && messageInfo?.role === 'user' && !userMessageId) {
+                             userMessageId = messageInfo.id;
+                         }
+
                          if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                              // Close reasoning tag if still open
                              if (insideReasoning) {
@@ -735,6 +748,8 @@ app.post('/v1/responses', async (req, res) => {
             let completionText = '';
             let reasoningText = '';
             let insideReasoning = false;
+            const partTextMap = new Map();
+            let userMessageId = null;
 
             sendResponseSseEvent(res, {
                 type: 'response.created',
@@ -789,10 +804,18 @@ app.post('/v1/responses', async (req, res) => {
                     }
 
                     if (event.type === 'message.part.updated') {
-                        const { part, delta } = event.properties;
-                        if (part.sessionID !== sessionId || !delta) {
+                        const { part } = event.properties;
+                        if (part.sessionID !== sessionId || part.messageID === userMessageId) {
                             continue;
                         }
+
+                        // Server sends cumulative part.text; diff against last seen text per part
+                        const hasFullText = part.text !== undefined;
+                        const delta = hasFullText
+                            ? part.text.slice((partTextMap.get(part.id) || '').length)
+                            : (event.properties.delta || '');
+                        if (hasFullText) partTextMap.set(part.id, part.text || '');
+                        if (!delta) continue;
 
                         if (part.type === 'reasoning') {
                             if (!insideReasoning) {
@@ -841,6 +864,9 @@ app.post('/v1/responses', async (req, res) => {
 
                     if (event.type === 'message.updated') {
                         const messageInfo = event.properties?.info;
+                        if (messageInfo?.sessionID === sessionId && messageInfo?.role === 'user' && !userMessageId) {
+                            userMessageId = messageInfo.id;
+                        }
                         if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
                             if (insideReasoning) {
                                 sendResponseSseEvent(res, {

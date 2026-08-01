@@ -205,6 +205,42 @@ describe('Proxy OpenAI API', () => {
         expect(thinkCloseCount).toEqual(1);
     });
 
+    test('POST /v1/chat/completions should stream cumulative part.text and skip user echo', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.updated', properties: { info: { id: 'msg_user', sessionID: sessionId, role: 'user' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_user', messageID: 'msg_user', sessionID: sessionId, type: 'text', text: 'Stream a short answer' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_reasoning', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: 'Think' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_reasoning', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: 'Thinking...' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: '' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Banana' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Banana!' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/big-pickle',
+                messages: [{ role: 'user', content: 'Stream a short answer' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('<think>');
+        expect(res.text).toContain('</think>');
+        expect(res.text).toContain('"content":"Banana"');
+        expect(res.text).toContain('"content":"!"');
+        expect(res.text).not.toContain('Stream a short answer');
+        expect(res.text).toContain('"finish_reason":"stop"');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
 
     test('POST /v1/chat/completions should return reasoning tokens when available (non-streaming)', async () => {
         const res = await request(app)
@@ -251,6 +287,40 @@ describe('Proxy OpenAI API', () => {
         expect(res.header['content-type']).toContain('text/event-stream');
         expect(res.text).toContain('"type":"response.created"');
         expect(res.text).toContain('"type":"response.output_text.delta"');
+        expect(res.text).toContain('"type":"response.completed"');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/responses should stream cumulative part.text and skip user echo', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.updated', properties: { info: { id: 'msg_user', sessionID: sessionId, role: 'user' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_user', messageID: 'msg_user', sessionID: sessionId, type: 'text', text: 'Stream a short answer' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_reasoning', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: 'Think' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_reasoning', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: 'Thinking...' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: '' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Banana' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Banana!' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/big-pickle',
+                input: 'Stream a short answer',
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('"type":"response.created"');
+        expect(res.text).toContain('Banana!');
+        expect(res.text).not.toContain('Stream a short answer');
         expect(res.text).toContain('"type":"response.completed"');
         expect(res.text).toContain('data: [DONE]');
     });
