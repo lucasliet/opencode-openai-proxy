@@ -64,8 +64,11 @@ function getClient() {
 
 function parseModel(model) {
     if (model && model.includes('/')) {
-        const [providerId, modelId] = model.split('/');
-        return { providerId, modelId };
+        const separatorIndex = model.indexOf('/');
+        return {
+            providerId: model.slice(0, separatorIndex),
+            modelId: model.slice(separatorIndex + 1)
+        };
     }
 
     return { providerId: 'opencode', modelId: 'big-pickle' };
@@ -245,6 +248,180 @@ function sendResponseSseEvent(res, payload) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+// Refusal phrases produced by agent-style models when no tools are allowed.
+// Word boundaries avoid matching subwords like "already" or "readily".
+const REFUSAL_PATTERN = /\b(?:ready|nothing to do|no request|no task|can'?t see)\b|\bwhat would you (?:like|do|work on)\b|\bhelp\s+with\b/i;
+
+/**
+ * Consumes the OpenCode SSE stream for a single prompt attempt, extracting text
+ * deltas from both the delta event flow (message.part.delta) and the cumulative
+ * message.part.updated flow used by newer servers. For the cumulative flow the
+ * delta is reconstructed by diffing part.text per part id, and the user's own
+ * echoed parts are suppressed so the prompt is never streamed back as output.
+ *
+ * The caller owns session/prompt setup, keepalive and SSE formatting; this
+ * function only drives the event loop and calls back for deltas/terminal states.
+ *
+ * @param {object} options
+ * @param {AsyncIterator} options.eventIterator SSE event iterator for this attempt
+ * @param {string} options.sessionId Session id to filter events by
+ * @param {object} options.res Express response (used for res.destroyed checks)
+ * @param {{ ended: boolean, streamedAnything: boolean, insideReasoning: boolean }} options.state
+ *   Mutable state shared with the caller, mutated as events are processed.
+ * @param {() => (Error|null)} options.getPromptError
+ * @param {(finish: string) => void} options.onFinish Called on terminal finish
+ * @param {(msg: string) => void} options.onFail Called on session.error / idle / errors
+ * @param {() => void} options.onReasoningStart
+ * @param {(delta: string) => void} options.onReasoningDelta
+ * @param {() => void} options.onReasoningEnd
+ * @param {(delta: string) => void} options.onTextDelta
+ */
+async function consumeStreamEvents({
+    eventIterator,
+    sessionId,
+    res,
+    state,
+    getPromptError,
+    onFinish,
+    onFail,
+    onReasoningStart,
+    onReasoningDelta,
+    onReasoningEnd,
+    onTextDelta
+}) {
+    const partTypes = new Map();
+    const partTexts = new Map();
+    const userMessageIds = new Set();
+
+    const emitDelta = (partType, delta) => {
+        if (!delta) return;
+        if (partType === 'reasoning') {
+            if (!state.insideReasoning) {
+                onReasoningStart();
+                state.insideReasoning = true;
+            }
+            onReasoningDelta(delta);
+            state.streamedAnything = true;
+        } else {
+            if (state.insideReasoning) {
+                onReasoningEnd();
+                state.insideReasoning = false;
+            }
+            onTextDelta(delta);
+            state.streamedAnything = true;
+        }
+    };
+
+    try {
+        // IMPORTANT: keep a single pending next() promise — creating a new
+        // one while the previous is pending discards events silently.
+        let pendingNext = eventIterator.next();
+        while (!res.destroyed && !state.ended) {
+            const pollTimeout = new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 1000));
+            const eventResult = await Promise.race([pendingNext, pollTimeout]);
+
+            if (eventResult.timeout) {
+                const promptError = getPromptError();
+                if (promptError) {
+                    console.warn('Ending stream due to prompt error:', promptError.message);
+                    onFail(promptError.message);
+                }
+                continue;
+            }
+
+            pendingNext = eventIterator.next();
+
+            if (eventResult.done) break;
+
+            const event = eventResult.value;
+
+            // Track user message ids so their echoed parts can be suppressed.
+            if (event.type === 'message.updated') {
+                const info = event.properties?.info;
+                if (info?.sessionID === sessionId) {
+                    if (info.role === 'user' && info.id) {
+                        userMessageIds.add(info.id);
+                    }
+                    // Any terminal finish value ends the stream; tool-calls is
+                    // intermediate (the model asked for tools) — keep streaming.
+                    if (info.finish && info.finish !== 'tool-calls') {
+                        onFinish(info.finish);
+                        break;
+                    }
+                }
+            }
+
+            if (event.type === 'message.part.updated') {
+                const { part, delta: legacyDelta } = event.properties || {};
+                if (!part || part?.sessionID !== sessionId) continue;
+                if (part?.id && part?.type) partTypes.set(part.id, part.type);
+
+                // Skip the user's own echoed parts so the prompt is not
+                // streamed back as assistant output.
+                if (part.role === 'user') continue;
+                if (part.messageID && userMessageIds.has(part.messageID)) continue;
+
+                const partType = part.type || partTypes.get(part.id) || 'text';
+
+                // Newer opencode servers only emit cumulative part.text (no
+                // delta field) — reconstruct the delta by diffing per part id.
+                // A snapshot shorter than the accumulated text means the server
+                // rewrote/truncated it, not new content, so emit no delta.
+                let delta = legacyDelta;
+                if (typeof part.text === 'string') {
+                    const prev = partTexts.get(part.id) || '';
+                    delta = part.text.startsWith(prev) ? part.text.slice(prev.length) : '';
+                    partTexts.set(part.id, part.text);
+                }
+
+                emitDelta(partType, delta);
+                continue;
+            }
+
+            // Streaming deltas come as message.part.delta in opencode >= 1.18.
+            // Keep partTexts in sync here too: opencode also emits cumulative
+            // message.part.updated snapshots for the same part, so the snapshot
+            // diff below must know how much text was already delivered.
+            if (event.type === 'message.part.delta') {
+                const { sessionID, partID, field, delta } = event.properties;
+                if (sessionID !== sessionId || field !== 'text' || !delta) continue;
+                emitDelta(partTypes.get(partID) || 'text', delta);
+                partTexts.set(partID, (partTexts.get(partID) || '') + delta);
+                continue;
+            }
+
+            // Session errored (e.g. model not found, provider failure)
+            if (event.type === 'session.error') {
+                const props = event.properties;
+                if (props?.sessionID === sessionId) {
+                    const msg = props?.error?.data?.message || props?.error?.message || 'Session error';
+                    onFail(msg);
+                }
+            }
+
+            // Session went idle: terminal signal for our session
+            if (event.type === 'session.idle') {
+                if (event.properties?.sessionID === sessionId) {
+                    if (state.streamedAnything) {
+                        onFinish('stop');
+                        break;
+                    } else {
+                        onFail('Session went idle without producing content');
+                    }
+                }
+            }
+        }
+    } catch (streamError) {
+        console.error('Streaming error:', streamError);
+        onFail(streamError.message);
+    } finally {
+        // Close the SSE subscription so no iterator stays open after the attempt.
+        if (eventIterator?.return) {
+            await eventIterator.return();
+        }
+    }
+}
+
 // Auth Middleware
 app.use((req, res, next) => {
     // Permite health check sem auth
@@ -352,13 +529,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             console.warn('Failed to set active model:', confError.message);
         }
 
-        // 2. Create session
-         const sessionRes = await client.session.create();
-         const sessionId = sessionRes.data?.id;
-
-         if (!sessionId) {
-             throw new Error('Failed to create session');
-         }
+         // 2. Sessions are created per attempt inside each branch below
          
          if (stream) {
              res.setHeader('Content-Type', 'text/event-stream');
@@ -368,11 +539,20 @@ app.post('/v1/chat/completions', async (req, res) => {
              const id = `chatcmpl-${crypto.randomUUID()}`;
              let completionTokens = 0;
              let reasoningTokens = 0;
-             let insideReasoning = false;
-             let hasStartedStreaming = false;
 
-             try {
-                 // 3. Send prompt (don't await - fire and forget)
+             // 3.-4. Send prompt + stream events (with retries for agent-style
+             //        models that occasionally error or refuse before content)
+             let attemptErrorMsg = null;
+
+             for (let attempt = 1; attempt <= 3 && !res.destroyed; attempt++) {
+                 const attemptSession = await client.session.create();
+                 const sessionId = attemptSession.data?.id;
+                 if (!sessionId) throw new Error('Failed to create session');
+
+                 let promptError = null;
+                 attemptErrorMsg = null;
+                 const state = { ended: false, streamedAnything: false, insideReasoning: false };
+
                  client.session.prompt({
                      path: { id: sessionId },
                      body: { 
@@ -384,188 +564,233 @@ app.post('/v1/chat/completions', async (req, res) => {
                          system: systemPrompt.trim(),
                          parts: allParts
                      }
-                 }).catch(err => console.warn('Prompt error:', err.message));
+                 }).then(r => {
+                     if (r?.response?.status >= 400) {
+                         promptError = new Error('OpenCode server returned HTTP ' + r.response.status);
+                         console.warn('Prompt error: HTTP', r.response.status);
+                     }
+                 }).catch(err => {
+                     promptError = err;
+                     console.warn('Prompt error:', err.message);
+                 });
 
-                 // 4. Subscribe to real-time events (SSE)
                  const eventStreamResult = await client.event.subscribe();
                  const eventStream = eventStreamResult.stream;
+                 const eventIterator = eventStream[Symbol.asyncIterator]();
 
-                 // Keepalive interval
                  const keepaliveInterval = setInterval(() => {
                      if (!res.destroyed) {
                          res.write(': keepalive\n\n');
                      }
                  }, 15000);
 
-                 // Process events
-                 for await (const event of eventStream) {
-                     if (res.destroyed) break;
-
-                     const eventData = event;
-                     
-                     // Filter for our session
-                     if (eventData.type === 'message.part.updated') {
-                         const { part, delta } = eventData.properties;
-                         
-                         // Skip if not our session
-                         if (part.sessionID !== sessionId) continue;
-
-                         // Handle reasoning parts
-                         if (part.type === 'reasoning') {
-                             if (delta) {
-                                 if (!insideReasoning) {
-                                     res.write(`data: ${JSON.stringify({
-                                         id,
-                                         object: 'chat.completion.chunk',
-                                         created: Math.floor(Date.now() / 1000),
-                                         model: `${providerId}/${modelId}`,
-                                         choices: [{
-                                             index: 0,
-                                             delta: { content: '<think>\n' },
-                                             finish_reason: null
-                                         }]
-                                     })}\n\n`);
-                                     insideReasoning = true;
-                                     hasStartedStreaming = true;
-                                 }
-
-                                 reasoningTokens += Math.ceil(delta.length / 4);
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: delta },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                             }
-                         }
-                         // Handle text parts
-                         else if (part.type === 'text') {
-                             // Close reasoning tag if we were inside it
-                             if (insideReasoning) {
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: '\n</think>\n\n' },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                                 insideReasoning = false;
-                             }
-
-                             if (delta) {
-                                 completionTokens += Math.ceil(delta.length / 4);
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: delta },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                                 hasStartedStreaming = true;
-                             }
-                         }
-                     }
-
-                     // Check if message is complete
-                     if (eventData.type === 'message.updated') {
-                         const messageInfo = eventData.properties?.info;
-                         
-                         if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
-                             // Close reasoning tag if still open
-                             if (insideReasoning) {
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: '\n</think>\n\n' },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                             }
-
-                             // Calculate usage
-                             const promptTokens = Math.ceil(fullPromptText.length / 4);
-                             const usage = {
-                                 prompt_tokens: promptTokens,
-                                 completion_tokens: completionTokens + reasoningTokens,
-                                 total_tokens: promptTokens + completionTokens + reasoningTokens,
-                                 completion_tokens_details: {
-                                     reasoning_tokens: reasoningTokens
-                                 }
-                             };
-
-                             const finalChunk = {
-                                 id,
-                                 object: 'chat.completion.chunk',
-                                 created: Math.floor(Date.now() / 1000),
-                                 model: `${providerId}/${modelId}`,
-                                 choices: [{
-                                     index: 0,
-                                     delta: {},
-                                     finish_reason: 'stop'
-                                 }],
-                                 usage
-                             };
-                             if (ignoredTools) {
-                                 finalChunk.metadata = { tools_support: 'tools/function calling is not enabled in this branch yet and was ignored' };
-                             }
-                             res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-                             res.write('data: [DONE]\n\n');
-                             clearInterval(keepaliveInterval);
-                             res.end();
-                             break;
-                         }
-                     }
-                 }
-
-                 clearInterval(keepaliveInterval);
-             } catch (streamError) {
-                 clearInterval(keepaliveInterval);
-                 console.error('Streaming error:', streamError);
-                 if (!res.destroyed && !res.headersSent) {
-                     res.status(500).json({ 
-                         error: { 
-                             message: 'Streaming error',
-                             details: streamError.message
-                         } 
-                     });
-                 } else if (!res.destroyed) {
+                 const writeChatDelta = (content) => {
                      res.write(`data: ${JSON.stringify({
-                         error: { message: streamError.message }
+                         id,
+                         object: 'chat.completion.chunk',
+                         created: Math.floor(Date.now() / 1000),
+                         model: `${providerId}/${modelId}`,
+                         choices: [{
+                             index: 0,
+                             delta: { content },
+                             finish_reason: null
+                         }]
                      })}\n\n`);
+                 };
+
+                 const closeReasoningTag = () => {
+                     if (!state.insideReasoning) return;
+                     writeChatDelta('\n</think>\n\n');
+                     state.insideReasoning = false;
+                 };
+
+                 const writeErrorChunk = (msg) => {
+                     if (res.destroyed) return;
+                     closeReasoningTag();
+                     res.write(`data: ${JSON.stringify({
+                         id,
+                         object: 'chat.completion.chunk',
+                         created: Math.floor(Date.now() / 1000),
+                         model: `${providerId}/${modelId}`,
+                         choices: [{
+                             index: 0,
+                             delta: {},
+                             finish_reason: 'error'
+                         }],
+                         error: { message: msg }
+                     })}\n\n`);
+                     res.write('data: [DONE]\n\n');
                      res.end();
+                 };
+
+                 const finalize = (finishReason) => {
+                     if (state.ended) return;
+                     state.ended = true;
+                     clearInterval(keepaliveInterval);
+                     if (res.destroyed) return;
+                     closeReasoningTag();
+
+                     const promptTokens = Math.ceil(fullPromptText.length / 4);
+                     const usage = {
+                         prompt_tokens: promptTokens,
+                         completion_tokens: completionTokens + reasoningTokens,
+                         total_tokens: promptTokens + completionTokens + reasoningTokens,
+                         completion_tokens_details: {
+                             reasoning_tokens: reasoningTokens
+                         }
+                     };
+
+                     const finalChunk = {
+                         id,
+                         object: 'chat.completion.chunk',
+                         created: Math.floor(Date.now() / 1000),
+                         model: `${providerId}/${modelId}`,
+                         choices: [{
+                             index: 0,
+                             delta: {},
+                             finish_reason: finishReason
+                         }],
+                         usage
+                     };
+                     if (ignoredTools) {
+                         finalChunk.metadata = { tools_support: 'tools/function calling is not enabled in this branch yet and was ignored' };
+                     }
+                     res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+                     res.write('data: [DONE]\n\n');
+                     res.end();
+                 };
+
+                 const failAttempt = (msg) => {
+                     if (state.ended) return;
+                     state.ended = true;
+                     clearInterval(keepaliveInterval);
+                     if (res.destroyed) return;
+                     if (state.streamedAnything) {
+                         // can't retry after content was sent — surface the error
+                         writeErrorChunk(msg);
+                     } else {
+                         attemptErrorMsg = msg;
+                     }
+                 };
+
+                 // Process events (poll so prompt failures never hang the stream).
+                 // The shared consumer reconstructs deltas from cumulative
+                 // part.text, suppresses the user's echoed parts, and closes the
+                 // SSE subscription when the attempt ends.
+                 await consumeStreamEvents({
+                     eventIterator,
+                     sessionId,
+                     res,
+                     state,
+                     getPromptError: () => promptError,
+                     onFinish: (finish) => finalize(finish === 'stop' ? 'stop' : finish),
+                     onFail: (msg) => failAttempt(msg),
+                     onReasoningStart: () => {
+                         writeChatDelta('<think>\n');
+                     },
+                     onReasoningDelta: (delta) => {
+                         reasoningTokens += Math.ceil(delta.length / 4);
+                         writeChatDelta(delta);
+                     },
+                     onReasoningEnd: () => closeReasoningTag(),
+                     onTextDelta: (delta) => {
+                         completionTokens += Math.ceil(delta.length / 4);
+                         writeChatDelta(delta);
+                     }
+                 });
+
+                 clearInterval(keepaliveInterval);
+
+                 if (!state.ended) {
+                     // stream closed without a terminal event
+                     failAttempt(promptError?.message || 'Stream ended unexpectedly');
                  }
+
+                 if (state.ended && state.streamedAnything) {
+                     // success (or error after content) — response already closed
+                     break;
+                 }
+
+                 if (attempt < 3) {
+                     console.warn(`Stream attempt ${attempt}/3 failed before content, retrying:`, attemptErrorMsg || 'unknown');
+                     continue;
+                 }
+
+                 // Last attempt failed before any content — surface the error
+                 console.warn('All stream attempts failed:', attemptErrorMsg || 'unknown');
+                 if (!res.destroyed) {
+                     writeErrorChunk(attemptErrorMsg || 'All stream attempts failed');
+                 }
+                 break;
              }
          } else {
-             // 3. Non-streaming: await complete response
-             const responseRes = await client.session.prompt({
-                 path: { id: sessionId },
-                 body: { 
-                     model: {
-                         providerID: providerId,
-                         modelID: modelId
-                     },
-                     prompt: fullPromptText.trim(),
-                     system: systemPrompt.trim(),
-                     parts: allParts
+             // 3. Non-streaming: await complete response (with retries for
+             //    agent-style models that occasionally error, refuse or hang)
+             const MAX_ATTEMPTS = 3;
+             const ATTEMPT_TIMEOUT_MS = 90000;
+             let responseData = null;
+             let lastError = null;
+
+             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                 const attemptSession = await client.session.create();
+                 const attemptSessionId = attemptSession.data?.id;
+                 if (!attemptSessionId) throw new Error('Failed to create session');
+
+                 const attemptPromise = client.session.prompt({
+                     path: { id: attemptSessionId },
+                     body: { 
+                         model: {
+                             providerID: providerId,
+                             modelID: modelId
+                         },
+                         prompt: fullPromptText.trim(),
+                         system: systemPrompt.trim(),
+                         parts: allParts
+                     }
+                 });
+                 let timeoutHandle;
+                 const timeoutPromise = new Promise((_, reject) => {
+                     timeoutHandle = setTimeout(() => reject(new Error(`Attempt ${attempt} timed out after ${ATTEMPT_TIMEOUT_MS / 1000}s`)), ATTEMPT_TIMEOUT_MS);
+                 });
+
+                 let responseRes;
+                 try {
+                     responseRes = await Promise.race([attemptPromise, timeoutPromise]);
+                 } catch (e) {
+                     lastError = e;
+                     console.warn(`Chat attempt ${attempt}/${MAX_ATTEMPTS} failed:`, e.message);
+                     if (attempt >= MAX_ATTEMPTS) break;
+                     continue;
+                 } finally {
+                     clearTimeout(timeoutHandle);
                  }
-             });
+
+                 if (responseRes?.response?.status >= 400) {
+                     lastError = new Error(responseRes?.error?.message || responseRes?.response?.body?.error?.message || `OpenCode server returned HTTP ${responseRes.response.status}`);
+                     console.warn(`Chat attempt ${attempt}/${MAX_ATTEMPTS} error:`, lastError.message);
+                     if (attempt >= MAX_ATTEMPTS) break;
+                     continue;
+                 }
+
+                 const attemptParts = responseRes.data?.parts || [];
+                 const attemptText = attemptParts.filter(p => p.type === 'text').map(p => p.text).join('');
+                 if (attemptText.trim() && REFUSAL_PATTERN.test(attemptText.slice(0, 150))) {
+                     lastError = new Error('Model refused to answer (no tools allowed in this proxy branch)');
+                     console.warn(`Chat attempt ${attempt}/${MAX_ATTEMPTS} refused: "${attemptText.slice(0, 60)}"`);
+                     if (attempt >= MAX_ATTEMPTS) {
+                         responseData = responseRes.data;
+                     }
+                     continue;
+                 }
+
+                 responseData = responseRes.data;
+                 break;
+             }
+
+             if (!responseData) {
+                 throw lastError || new Error('All chat attempts failed');
+             }
+             const responseRes = { data: responseData };
 
              // Format content
              let content = '';
@@ -734,7 +959,6 @@ app.post('/v1/responses', async (req, res) => {
 
             let completionText = '';
             let reasoningText = '';
-            let insideReasoning = false;
 
             sendResponseSseEvent(res, {
                 type: 'response.created',
@@ -760,7 +984,15 @@ app.post('/v1/responses', async (req, res) => {
                 }
             });
 
-            try {
+            let attemptErrorMsg = null;
+
+            for (let attempt = 1; attempt <= 3 && !res.destroyed; attempt++) {
+                // Reuse the (continuation) session on every attempt so retries
+                // never lose conversation history for previous_response_id.
+                let promptError = null;
+                attemptErrorMsg = null;
+                const state = { ended: false, streamedAnything: false, insideReasoning: false };
+
                 client.session.prompt({
                     path: { id: sessionId },
                     body: {
@@ -772,10 +1004,19 @@ app.post('/v1/responses', async (req, res) => {
                         system: systemPrompt,
                         parts: allParts
                     }
-                }).catch((err) => console.warn('Prompt error:', err.message));
+                }).then(r => {
+                    if (r?.response?.status >= 400) {
+                        promptError = new Error('OpenCode server returned HTTP ' + r.response.status);
+                        console.warn('Prompt error: HTTP', r.response.status);
+                    }
+                }).catch((err) => {
+                    promptError = err;
+                    console.warn('Prompt error:', err.message);
+                });
 
                 const eventStreamResult = await client.event.subscribe();
                 const eventStream = eventStreamResult.stream;
+                const eventIterator = eventStream[Symbol.asyncIterator]();
 
                 const keepaliveInterval = setInterval(() => {
                     if (!res.destroyed) {
@@ -783,160 +1024,220 @@ app.post('/v1/responses', async (req, res) => {
                     }
                 }, 15000);
 
-                for await (const event of eventStream) {
-                    if (res.destroyed) {
-                        break;
-                    }
+                const sendTextDelta = (delta) => {
+                    sendResponseSseEvent(res, {
+                        type: 'response.output_text.delta',
+                        response_id: responseId,
+                        output_index: 0,
+                        content_index: 0,
+                        delta
+                    });
+                };
 
-                    if (event.type === 'message.part.updated') {
-                        const { part, delta } = event.properties;
-                        if (part.sessionID !== sessionId || !delta) {
-                            continue;
-                        }
-
-                        if (part.type === 'reasoning') {
-                            if (!insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '<think>\n'
-                                });
-                                reasoningText += '<think>\n';
-                                insideReasoning = true;
-                            }
-
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_text.delta',
-                                response_id: responseId,
-                                output_index: 0,
-                                content_index: 0,
-                                delta
-                            });
-                            reasoningText += delta;
-                        } else if (part.type === 'text') {
-                            if (insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '\n</think>\n\n'
-                                });
-                                reasoningText += '\n</think>\n\n';
-                                insideReasoning = false;
-                            }
-
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_text.delta',
-                                response_id: responseId,
-                                output_index: 0,
-                                content_index: 0,
-                                delta
-                            });
-                            completionText += delta;
-                        }
-                    }
-
-                    if (event.type === 'message.updated') {
-                        const messageInfo = event.properties?.info;
-                        if (messageInfo?.sessionID === sessionId && messageInfo?.finish === 'stop') {
-                            if (insideReasoning) {
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta: '\n</think>\n\n'
-                                });
-                                reasoningText += '\n</think>\n\n';
-                            }
-
-                            const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
-
-                            sendResponseSseEvent(res, {
-                                type: 'response.output_item.done',
-                                response_id: responseId,
-                                output_index: 0,
-                                item: {
-                                    id: outputMessageId,
-                                    type: 'message',
-                                    role: 'assistant',
-                                    status: 'completed',
-                                    content: [{ type: 'output_text', text: `${reasoningText}${completionText}` }]
-                                }
-                            });
-
-                            const finalResponseEvent = {
-                                type: 'response.completed',
-                                response: {
-                                    id: responseId,
-                                    object: 'response',
-                                    created_at: createdAt,
-                                    status: 'completed',
-                                    model: `${providerId}/${modelId}`,
-                                    output: [{
-                                        id: outputMessageId,
-                                        type: 'message',
-                                        role: 'assistant',
-                                        status: 'completed',
-                                        content: [{ type: 'output_text', text: `${reasoningText}${completionText}` }]
-                                    }],
-                                    usage,
-                                    error: null
-                                }
-                            };
-                            if (ignoredTools) {
-                                finalResponseEvent.response.metadata = { tools_support: 'tools/function calling for /v1/responses is not enabled in this branch yet and was ignored' };
-                            }
-                            sendResponseSseEvent(res, finalResponseEvent);
-
-                            storeResponseState(responseId, {
-                                sessionId,
-                                model: `${providerId}/${modelId}`
-                            });
-
-                            res.write('data: [DONE]\n\n');
-                            clearInterval(keepaliveInterval);
-                            res.end();
-                            break;
-                        }
-                    }
-                }
-
-                clearInterval(keepaliveInterval);
-            } catch (streamError) {
-                clearInterval(keepaliveInterval);
-                console.error('Responses streaming error:', streamError);
-                if (!res.destroyed) {
+                const writeErrorEvent = (msg) => {
+                    if (res.destroyed) return;
                     sendResponseSseEvent(res, {
                         type: 'error',
                         error: {
-                            message: streamError.message
+                            message: msg || 'stream ended without completion'
                         }
                     });
+                    res.write('data: [DONE]\n\n');
                     res.end();
+                };
+
+                const closeReasoningTag = () => {
+                    if (!state.insideReasoning) return;
+                    sendTextDelta('\n</think>\n\n');
+                    reasoningText += '\n</think>\n\n';
+                    state.insideReasoning = false;
+                };
+
+                const finalize = (status) => {
+                    if (state.ended) return;
+                    state.ended = true;
+                    clearInterval(keepaliveInterval);
+                    if (res.destroyed) return;
+
+                    closeReasoningTag();
+
+                    const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
+
+                    sendResponseSseEvent(res, {
+                        type: 'response.output_item.done',
+                        response_id: responseId,
+                        output_index: 0,
+                        item: {
+                            id: outputMessageId,
+                            type: 'message',
+                            role: 'assistant',
+                            status: status === 'completed' ? 'completed' : 'incomplete',
+                            content: [{ type: 'output_text', text: `${reasoningText}${completionText}` }]
+                        }
+                    });
+
+                    const finalResponseEvent = {
+                        type: status === 'completed' ? 'response.completed' : 'response.incomplete',
+                        response: {
+                            id: responseId,
+                            object: 'response',
+                            created_at: createdAt,
+                            status,
+                            model: `${providerId}/${modelId}`,
+                            output: [{
+                                id: outputMessageId,
+                                type: 'message',
+                                role: 'assistant',
+                                status: status === 'completed' ? 'completed' : 'incomplete',
+                                content: [{ type: 'output_text', text: `${reasoningText}${completionText}` }]
+                            }],
+                            usage,
+                            error: null
+                        }
+                    };
+                    if (ignoredTools) {
+                        finalResponseEvent.response.metadata = { tools_support: 'tools/function calling for /v1/responses is not enabled in this branch yet and was ignored' };
+                    }
+                    sendResponseSseEvent(res, finalResponseEvent);
+
+                    storeResponseState(responseId, {
+                        sessionId,
+                        model: `${providerId}/${modelId}`
+                    });
+
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                };
+
+                const failAttempt = (msg) => {
+                    if (state.ended) return;
+                    state.ended = true;
+                    clearInterval(keepaliveInterval);
+                    if (res.destroyed) return;
+                    if (state.streamedAnything) {
+                        // can't retry after content was sent — surface the error
+                        writeErrorEvent(msg);
+                    } else {
+                        attemptErrorMsg = msg;
+                    }
+                };
+
+                // Process events (poll so prompt failures never hang the stream).
+                // The shared consumer reconstructs deltas from cumulative
+                // part.text, suppresses the user's echoed parts, and closes the
+                // SSE subscription when the attempt ends.
+                await consumeStreamEvents({
+                    eventIterator,
+                    sessionId,
+                    res,
+                    state,
+                    getPromptError: () => promptError,
+                    onFinish: (finish) => finalize(finish === 'stop' ? 'completed' : 'incomplete'),
+                    onFail: (msg) => failAttempt(msg),
+                    onReasoningStart: () => {
+                        sendTextDelta('<think>\n');
+                        reasoningText += '<think>\n';
+                    },
+                    onReasoningDelta: (delta) => {
+                        sendTextDelta(delta);
+                        reasoningText += delta;
+                    },
+                    onReasoningEnd: () => closeReasoningTag(),
+                    onTextDelta: (delta) => {
+                        sendTextDelta(delta);
+                        completionText += delta;
+                    }
+                });
+
+                clearInterval(keepaliveInterval);
+
+                if (!state.ended) {
+                    failAttempt(promptError?.message || 'Stream ended unexpectedly');
                 }
+
+                if (state.ended && state.streamedAnything) {
+                    break;
+                }
+
+                if (attempt < 3) {
+                    console.warn(`Responses stream attempt ${attempt}/3 failed before content, retrying:`, attemptErrorMsg || 'unknown');
+                    continue;
+                }
+
+                console.warn('All responses stream attempts failed:', attemptErrorMsg || 'unknown');
+                if (!res.destroyed) {
+                    writeErrorEvent(attemptErrorMsg || 'All stream attempts failed');
+                }
+                break;
             }
 
             return;
         }
 
-        const responseRes = await client.session.prompt({
-            path: { id: sessionId },
-            body: {
-                model: {
-                    providerID: providerId,
-                    modelID: modelId
-                },
-                prompt: fullPromptText,
-                system: systemPrompt,
-                parts: allParts
-            }
-        });
+        const MAX_ATTEMPTS = 3;
+        const ATTEMPT_TIMEOUT_MS = 90000;
+        let responseData = null;
+        let lastError = null;
 
-        const parts = responseRes.data?.parts || [];
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            // Reuse the (continuation) session on every attempt so retries
+            // never lose conversation history for previous_response_id.
+            const attemptPromise = client.session.prompt({
+                path: { id: sessionId },
+                body: {
+                    model: {
+                        providerID: providerId,
+                        modelID: modelId
+                    },
+                    prompt: fullPromptText,
+                    system: systemPrompt,
+                    parts: allParts
+                }
+            });
+            let timeoutHandle;
+            const timeoutPromise = new Promise((_, reject) => {
+                timeoutHandle = setTimeout(() => reject(new Error(`Attempt ${attempt} timed out after ${ATTEMPT_TIMEOUT_MS / 1000}s`)), ATTEMPT_TIMEOUT_MS);
+            });
+
+            let responseRes;
+            try {
+                responseRes = await Promise.race([attemptPromise, timeoutPromise]);
+            } catch (e) {
+                lastError = e;
+                console.warn(`Responses attempt ${attempt}/${MAX_ATTEMPTS} failed:`, e.message);
+                if (attempt >= MAX_ATTEMPTS) break;
+                continue;
+            } finally {
+                clearTimeout(timeoutHandle);
+            }
+
+            if (responseRes?.response?.status >= 400) {
+                lastError = new Error(responseRes?.error?.message || responseRes?.response?.body?.error?.message || `OpenCode server returned HTTP ${responseRes.response.status}`);
+                console.warn(`Responses attempt ${attempt}/${MAX_ATTEMPTS} error:`, lastError.message);
+                if (attempt >= MAX_ATTEMPTS) break;
+                continue;
+            }
+
+            const attemptParts = responseRes.data?.parts || [];
+            const attemptText = attemptParts.filter(p => p.type === 'text').map(p => p.text).join('');
+            if (attemptText.trim() && REFUSAL_PATTERN.test(attemptText.slice(0, 150))) {
+                lastError = new Error('Model refused to answer (no tools allowed in this proxy branch)');
+                console.warn(`Responses attempt ${attempt}/${MAX_ATTEMPTS} refused: "${attemptText.slice(0, 60)}"`);
+                if (attempt >= MAX_ATTEMPTS) {
+                    responseData = responseRes.data;
+                }
+                continue;
+            }
+
+            responseData = responseRes.data;
+            break;
+        }
+
+        if (!responseData) {
+            throw lastError || new Error('All responses attempts failed');
+        }
+
+        const parts = responseData.parts || [];
         const content = parts
             .filter((p) => p.type === 'text')
             .map((p) => p.text)
