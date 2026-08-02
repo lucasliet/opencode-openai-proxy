@@ -472,7 +472,12 @@ describe('Proxy OpenAI API', () => {
             });
 
         expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('Calling tool');
+        const deltas = res.text
+            .split('\n\n')
+            .filter(chunk => chunk.includes('response.output_text.delta'))
+            .join('');
+        expect(deltas).toContain('"delta":"Calling"');
+        expect(deltas).toContain('"delta":" tool"');
         expect(res.text).toContain('"type":"response.completed"');
         expect(res.text).toContain('data: [DONE]');
     });

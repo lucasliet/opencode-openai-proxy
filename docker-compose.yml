@@ -7,6 +7,8 @@ services:
       - "4097:4097" # Native OpenCode API
     environment:
       - OPENCODE_SERVER_PASSWORD=${OPENCODE_PASSWORD:-admin}
+      - PROXY_HOST=${PROXY_HOST:-0.0.0.0}
+      - PROXY_PORT=${PROXY_PORT:-4096}
     volumes:
       # Persiste autenticação e configurações
       - opencode_data:/home/node/.local/share/opencode

@@ -365,10 +365,12 @@ async function consumeStreamEvents({
 
                 // Newer opencode servers only emit cumulative part.text (no
                 // delta field) — reconstruct the delta by diffing per part id.
+                // A snapshot shorter than the accumulated text means the server
+                // rewrote/truncated it, not new content, so emit no delta.
                 let delta = legacyDelta;
                 if (typeof part.text === 'string') {
                     const prev = partTexts.get(part.id) || '';
-                    delta = part.text.length >= prev.length ? part.text.slice(prev.length) : part.text;
+                    delta = part.text.startsWith(prev) ? part.text.slice(prev.length) : '';
                     partTexts.set(part.id, part.text);
                 }
 
