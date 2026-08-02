@@ -64,8 +64,11 @@ function getClient() {
 
 function parseModel(model) {
     if (model && model.includes('/')) {
-        const [providerId, modelId] = model.split('/');
-        return { providerId, modelId };
+        const separatorIndex = model.indexOf('/');
+        return {
+            providerId: model.slice(0, separatorIndex),
+            modelId: model.slice(separatorIndex + 1)
+        };
     }
 
     return { providerId: 'opencode', modelId: 'big-pickle' };
@@ -245,6 +248,178 @@ function sendResponseSseEvent(res, payload) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+// Refusal phrases produced by agent-style models when no tools are allowed.
+// Word boundaries avoid matching subwords like "already" or "readily".
+const REFUSAL_PATTERN = /\b(?:ready|nothing to do|no request|no task|can'?t see)\b|\bwhat would you (?:like|do|work on)\b|\bhelp\s+with\b/i;
+
+/**
+ * Consumes the OpenCode SSE stream for a single prompt attempt, extracting text
+ * deltas from both the delta event flow (message.part.delta) and the cumulative
+ * message.part.updated flow used by newer servers. For the cumulative flow the
+ * delta is reconstructed by diffing part.text per part id, and the user's own
+ * echoed parts are suppressed so the prompt is never streamed back as output.
+ *
+ * The caller owns session/prompt setup, keepalive and SSE formatting; this
+ * function only drives the event loop and calls back for deltas/terminal states.
+ *
+ * @param {object} options
+ * @param {AsyncIterator} options.eventIterator SSE event iterator for this attempt
+ * @param {string} options.sessionId Session id to filter events by
+ * @param {object} options.res Express response (used for res.destroyed checks)
+ * @param {{ ended: boolean, streamedAnything: boolean, insideReasoning: boolean }} options.state
+ *   Mutable state shared with the caller, mutated as events are processed.
+ * @param {() => (Error|null)} options.getPromptError
+ * @param {(finish: string) => void} options.onFinish Called on terminal finish
+ * @param {(msg: string) => void} options.onFail Called on session.error / idle / errors
+ * @param {() => void} options.onReasoningStart
+ * @param {(delta: string) => void} options.onReasoningDelta
+ * @param {() => void} options.onReasoningEnd
+ * @param {(delta: string) => void} options.onTextDelta
+ */
+async function consumeStreamEvents({
+    eventIterator,
+    sessionId,
+    res,
+    state,
+    getPromptError,
+    onFinish,
+    onFail,
+    onReasoningStart,
+    onReasoningDelta,
+    onReasoningEnd,
+    onTextDelta
+}) {
+    const partTypes = new Map();
+    const partTexts = new Map();
+    const userMessageIds = new Set();
+
+    const emitDelta = (partType, delta) => {
+        if (!delta) return;
+        if (partType === 'reasoning') {
+            if (!state.insideReasoning) {
+                onReasoningStart();
+                state.insideReasoning = true;
+            }
+            onReasoningDelta(delta);
+            state.streamedAnything = true;
+        } else {
+            if (state.insideReasoning) {
+                onReasoningEnd();
+                state.insideReasoning = false;
+            }
+            onTextDelta(delta);
+            state.streamedAnything = true;
+        }
+    };
+
+    try {
+        // IMPORTANT: keep a single pending next() promise — creating a new
+        // one while the previous is pending discards events silently.
+        let pendingNext = eventIterator.next();
+        while (!res.destroyed && !state.ended) {
+            const pollTimeout = new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 1000));
+            const eventResult = await Promise.race([pendingNext, pollTimeout]);
+
+            if (eventResult.timeout) {
+                const promptError = getPromptError();
+                if (promptError) {
+                    console.warn('Ending stream due to prompt error:', promptError.message);
+                    onFail(promptError.message);
+                }
+                continue;
+            }
+
+            pendingNext = eventIterator.next();
+
+            if (eventResult.done) break;
+
+            const event = eventResult.value;
+
+            // Track user message ids so their echoed parts can be suppressed.
+            if (event.type === 'message.updated') {
+                const info = event.properties?.info;
+                if (info?.sessionID === sessionId) {
+                    if (info.role === 'user' && info.id) {
+                        userMessageIds.add(info.id);
+                    }
+                    // Any terminal finish value ends the stream; tool-calls is
+                    // intermediate (the model asked for tools) — keep streaming.
+                    if (info.finish && info.finish !== 'tool-calls') {
+                        onFinish(info.finish);
+                        break;
+                    }
+                }
+            }
+
+            if (event.type === 'message.part.updated') {
+                const { part, delta: legacyDelta } = event.properties || {};
+                if (!part || part?.sessionID !== sessionId) continue;
+                if (part?.id && part?.type) partTypes.set(part.id, part.type);
+
+                // Skip the user's own echoed parts so the prompt is not
+                // streamed back as assistant output.
+                if (part.role === 'user') continue;
+                if (part.messageID && userMessageIds.has(part.messageID)) continue;
+
+                const partType = part.type || partTypes.get(part.id) || 'text';
+
+                // Newer opencode servers only emit cumulative part.text (no
+                // delta field) — reconstruct the delta by diffing per part id.
+                let delta = legacyDelta;
+                if (typeof part.text === 'string') {
+                    const prev = partTexts.get(part.id) || '';
+                    delta = part.text.length >= prev.length ? part.text.slice(prev.length) : part.text;
+                    partTexts.set(part.id, part.text);
+                }
+
+                emitDelta(partType, delta);
+                continue;
+            }
+
+            // Streaming deltas come as message.part.delta in opencode >= 1.18.
+            // Keep partTexts in sync here too: opencode also emits cumulative
+            // message.part.updated snapshots for the same part, so the snapshot
+            // diff below must know how much text was already delivered.
+            if (event.type === 'message.part.delta') {
+                const { sessionID, partID, field, delta } = event.properties;
+                if (sessionID !== sessionId || field !== 'text' || !delta) continue;
+                emitDelta(partTypes.get(partID) || 'text', delta);
+                partTexts.set(partID, (partTexts.get(partID) || '') + delta);
+                continue;
+            }
+
+            // Session errored (e.g. model not found, provider failure)
+            if (event.type === 'session.error') {
+                const props = event.properties;
+                if (props?.sessionID === sessionId) {
+                    const msg = props?.error?.data?.message || props?.error?.message || 'Session error';
+                    onFail(msg);
+                }
+            }
+
+            // Session went idle: terminal signal for our session
+            if (event.type === 'session.idle') {
+                if (event.properties?.sessionID === sessionId) {
+                    if (state.streamedAnything) {
+                        onFinish('stop');
+                        break;
+                    } else {
+                        onFail('Session went idle without producing content');
+                    }
+                }
+            }
+        }
+    } catch (streamError) {
+        console.error('Streaming error:', streamError);
+        onFail(streamError.message);
+    } finally {
+        // Close the SSE subscription so no iterator stays open after the attempt.
+        if (eventIterator?.return) {
+            await eventIterator.return();
+        }
+    }
+}
+
 // Auth Middleware
 app.use((req, res, next) => {
     // Permite health check sem auth
@@ -362,12 +537,9 @@ app.post('/v1/chat/completions', async (req, res) => {
              const id = `chatcmpl-${crypto.randomUUID()}`;
              let completionTokens = 0;
              let reasoningTokens = 0;
-             let insideReasoning = false;
-             let hasStartedStreaming = false;
 
              // 3.-4. Send prompt + stream events (with retries for agent-style
              //        models that occasionally error or refuse before content)
-             let streamedAnything = false;
              let attemptErrorMsg = null;
 
              for (let attempt = 1; attempt <= 3 && !res.destroyed; attempt++) {
@@ -376,8 +548,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                  if (!sessionId) throw new Error('Failed to create session');
 
                  let promptError = null;
-                 let ended = false;
                  attemptErrorMsg = null;
+                 const state = { ended: false, streamedAnything: false, insideReasoning: false };
 
                  client.session.prompt({
                      path: { id: sessionId },
@@ -410,10 +582,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                      }
                  }, 15000);
 
-                 const partTypes = new Map();
-
-                 const closeReasoningTag = () => {
-                     if (!insideReasoning) return;
+                 const writeChatDelta = (content) => {
                      res.write(`data: ${JSON.stringify({
                          id,
                          object: 'chat.completion.chunk',
@@ -421,11 +590,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                          model: `${providerId}/${modelId}`,
                          choices: [{
                              index: 0,
-                             delta: { content: '\n</think>\n\n' },
+                             delta: { content },
                              finish_reason: null
                          }]
                      })}\n\n`);
-                     insideReasoning = false;
+                 };
+
+                 const closeReasoningTag = () => {
+                     if (!state.insideReasoning) return;
+                     writeChatDelta('\n</think>\n\n');
+                     state.insideReasoning = false;
                  };
 
                  const writeErrorChunk = (msg) => {
@@ -448,8 +622,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                  };
 
                  const finalize = (finishReason) => {
-                     if (ended) return;
-                     ended = true;
+                     if (state.ended) return;
+                     state.ended = true;
                      clearInterval(keepaliveInterval);
                      if (res.destroyed) return;
                      closeReasoningTag();
@@ -485,11 +659,11 @@ app.post('/v1/chat/completions', async (req, res) => {
                  };
 
                  const failAttempt = (msg) => {
-                     if (ended) return;
-                     ended = true;
+                     if (state.ended) return;
+                     state.ended = true;
                      clearInterval(keepaliveInterval);
                      if (res.destroyed) return;
-                     if (streamedAnything) {
+                     if (state.streamedAnything) {
                          // can't retry after content was sent — surface the error
                          writeErrorChunk(msg);
                      } else {
@@ -497,154 +671,40 @@ app.post('/v1/chat/completions', async (req, res) => {
                      }
                  };
 
-                 try {
-                     // Process events (poll so prompt failures never hang the stream).
-                     // IMPORTANT: keep a single pending next() promise — creating a new
-                     // one while the previous is pending discards events silently.
-                     let pendingNext = eventIterator.next();
-                     while (!res.destroyed && !ended) {
-                         const pollTimeout = new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 1000));
-                         const eventResult = await Promise.race([pendingNext, pollTimeout]);
-
-                         if (eventResult.timeout) {
-                             if (promptError) {
-                                 console.warn('Ending stream due to prompt error:', promptError.message);
-                                 failAttempt(promptError.message);
-                             }
-                             continue;
-                         }
-
-                         pendingNext = eventIterator.next();
-
-                         if (eventResult.done) break;
-
-                         const eventData = eventResult.value;
-
-                         // Track part types by partID (new opencode event flow)
-                         if (eventData.type === 'message.part.updated') {
-                             const { part } = eventData.properties;
-                             if (part?.sessionID !== sessionId) continue;
-                             if (part?.id && part?.type) partTypes.set(part.id, part.type);
-                             continue;
-                         }
-
-                         // Streaming deltas come as message.part.delta in opencode >= 1.18
-                         if (eventData.type === 'message.part.delta') {
-                             const { sessionID, partID, field, delta } = eventData.properties;
-                             if (sessionID !== sessionId || field !== 'text' || !delta) continue;
-                             const partType = partTypes.get(partID) || 'text';
-
-                             // Handle reasoning parts
-                             if (partType === 'reasoning') {
-                                 if (!insideReasoning) {
-                                     res.write(`data: ${JSON.stringify({
-                                         id,
-                                         object: 'chat.completion.chunk',
-                                         created: Math.floor(Date.now() / 1000),
-                                         model: `${providerId}/${modelId}`,
-                                         choices: [{
-                                             index: 0,
-                                             delta: { content: '<think>\n' },
-                                             finish_reason: null
-                                         }]
-                                     })}\n\n`);
-                                     insideReasoning = true;
-                                     hasStartedStreaming = true;
-                                 }
-
-                                 reasoningTokens += Math.ceil(delta.length / 4);
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: delta },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                                 streamedAnything = true;
-                             }
-                             // Handle text parts
-                             else {
-                                 // Close reasoning tag if we were inside it
-                                 if (insideReasoning) {
-                                     res.write(`data: ${JSON.stringify({
-                                         id,
-                                         object: 'chat.completion.chunk',
-                                         created: Math.floor(Date.now() / 1000),
-                                         model: `${providerId}/${modelId}`,
-                                         choices: [{
-                                             index: 0,
-                                             delta: { content: '\n</think>\n\n' },
-                                             finish_reason: null
-                                         }]
-                                     })}\n\n`);
-                                     insideReasoning = false;
-                                 }
-
-                                 completionTokens += Math.ceil(delta.length / 4);
-                                 res.write(`data: ${JSON.stringify({
-                                     id,
-                                     object: 'chat.completion.chunk',
-                                     created: Math.floor(Date.now() / 1000),
-                                     model: `${providerId}/${modelId}`,
-                                     choices: [{
-                                         index: 0,
-                                         delta: { content: delta },
-                                         finish_reason: null
-                                     }]
-                                 })}\n\n`);
-                                 hasStartedStreaming = true;
-                                 streamedAnything = true;
-                             }
-                         }
-
-                         // Check if message is complete (any terminal finish value
-                         // ends the stream; tool-calls is intermediate — keep streaming)
-                         if (eventData.type === 'message.updated') {
-                             const messageInfo = eventData.properties?.info;
-                             
-                             if (messageInfo?.sessionID === sessionId && messageInfo?.finish && messageInfo?.finish !== 'tool-calls') {
-                                 finalize(messageInfo.finish === 'stop' ? 'stop' : messageInfo.finish);
-                                 break;
-                             }
-                         }
-
-                         // Session errored (e.g. model not found, provider failure)
-                         if (eventData.type === 'session.error') {
-                             const props = eventData.properties;
-                             if (props?.sessionID === sessionId) {
-                                 const msg = props?.error?.data?.message || props?.error?.message || 'Session error';
-                                 failAttempt(msg);
-                             }
-                         }
-
-                         // Session went idle: terminal signal for our session
-                         if (eventData.type === 'session.idle') {
-                             if (eventData.properties?.sessionID === sessionId) {
-                                 if (streamedAnything) {
-                                     finalize('stop');
-                                 } else {
-                                     failAttempt('Session went idle without producing content');
-                                 }
-                             }
-                         }
+                 // Process events (poll so prompt failures never hang the stream).
+                 // The shared consumer reconstructs deltas from cumulative
+                 // part.text, suppresses the user's echoed parts, and closes the
+                 // SSE subscription when the attempt ends.
+                 await consumeStreamEvents({
+                     eventIterator,
+                     sessionId,
+                     res,
+                     state,
+                     getPromptError: () => promptError,
+                     onFinish: (finish) => finalize(finish === 'stop' ? 'stop' : finish),
+                     onFail: (msg) => failAttempt(msg),
+                     onReasoningStart: () => {
+                         writeChatDelta('<think>\n');
+                     },
+                     onReasoningDelta: (delta) => {
+                         reasoningTokens += Math.ceil(delta.length / 4);
+                         writeChatDelta(delta);
+                     },
+                     onReasoningEnd: () => closeReasoningTag(),
+                     onTextDelta: (delta) => {
+                         completionTokens += Math.ceil(delta.length / 4);
+                         writeChatDelta(delta);
                      }
-                 } catch (streamError) {
-                     console.error('Streaming error:', streamError);
-                     failAttempt(streamError.message);
-                 }
+                 });
 
                  clearInterval(keepaliveInterval);
 
-                 if (!ended) {
+                 if (!state.ended) {
                      // stream closed without a terminal event
                      failAttempt(promptError?.message || 'Stream ended unexpectedly');
                  }
 
-                 if (ended && streamedAnything) {
+                 if (state.ended && state.streamedAnything) {
                      // success (or error after content) — response already closed
                      break;
                  }
@@ -664,7 +724,6 @@ app.post('/v1/chat/completions', async (req, res) => {
          } else {
              // 3. Non-streaming: await complete response (with retries for
              //    agent-style models that occasionally error, refuse or hang)
-             const REFUSAL_PATTERN = /ready|what would you (like|do|work on)|nothing to do|no request|no task|can'?t see|help\s+with/i;
              const MAX_ATTEMPTS = 3;
              const ATTEMPT_TIMEOUT_MS = 90000;
              let responseData = null;
@@ -687,9 +746,10 @@ app.post('/v1/chat/completions', async (req, res) => {
                          parts: allParts
                      }
                  });
-                 const timeoutPromise = new Promise((_, reject) =>
-                     setTimeout(() => reject(new Error(`Attempt ${attempt} timed out after ${ATTEMPT_TIMEOUT_MS / 1000}s`)), ATTEMPT_TIMEOUT_MS)
-                 );
+                 let timeoutHandle;
+                 const timeoutPromise = new Promise((_, reject) => {
+                     timeoutHandle = setTimeout(() => reject(new Error(`Attempt ${attempt} timed out after ${ATTEMPT_TIMEOUT_MS / 1000}s`)), ATTEMPT_TIMEOUT_MS);
+                 });
 
                  let responseRes;
                  try {
@@ -699,6 +759,8 @@ app.post('/v1/chat/completions', async (req, res) => {
                      console.warn(`Chat attempt ${attempt}/${MAX_ATTEMPTS} failed:`, e.message);
                      if (attempt >= MAX_ATTEMPTS) break;
                      continue;
+                 } finally {
+                     clearTimeout(timeoutHandle);
                  }
 
                  if (responseRes?.response?.status >= 400) {
@@ -895,7 +957,6 @@ app.post('/v1/responses', async (req, res) => {
 
             let completionText = '';
             let reasoningText = '';
-            let insideReasoning = false;
 
             sendResponseSseEvent(res, {
                 type: 'response.created',
@@ -921,24 +982,17 @@ app.post('/v1/responses', async (req, res) => {
                 }
             });
 
-            let streamedAnything = false;
             let attemptErrorMsg = null;
 
             for (let attempt = 1; attempt <= 3 && !res.destroyed; attempt++) {
-                // Reuse the continuation session on the first attempt only
-                let attemptSessionId = attempt === 1 ? sessionId : null;
-                if (!attemptSessionId) {
-                    const attemptSession = await client.session.create();
-                    attemptSessionId = attemptSession.data?.id;
-                }
-                if (!attemptSessionId) throw new Error('Failed to create session');
-
+                // Reuse the (continuation) session on every attempt so retries
+                // never lose conversation history for previous_response_id.
                 let promptError = null;
-                let ended = false;
                 attemptErrorMsg = null;
+                const state = { ended: false, streamedAnything: false, insideReasoning: false };
 
                 client.session.prompt({
-                    path: { id: attemptSessionId },
+                    path: { id: sessionId },
                     body: {
                         model: {
                             providerID: providerId,
@@ -968,7 +1022,15 @@ app.post('/v1/responses', async (req, res) => {
                     }
                 }, 15000);
 
-                const partTypes = new Map();
+                const sendTextDelta = (delta) => {
+                    sendResponseSseEvent(res, {
+                        type: 'response.output_text.delta',
+                        response_id: responseId,
+                        output_index: 0,
+                        content_index: 0,
+                        delta
+                    });
+                };
 
                 const writeErrorEvent = (msg) => {
                     if (res.destroyed) return;
@@ -982,23 +1044,20 @@ app.post('/v1/responses', async (req, res) => {
                     res.end();
                 };
 
+                const closeReasoningTag = () => {
+                    if (!state.insideReasoning) return;
+                    sendTextDelta('\n</think>\n\n');
+                    reasoningText += '\n</think>\n\n';
+                    state.insideReasoning = false;
+                };
+
                 const finalize = (status) => {
-                    if (ended) return;
-                    ended = true;
+                    if (state.ended) return;
+                    state.ended = true;
                     clearInterval(keepaliveInterval);
                     if (res.destroyed) return;
 
-                    if (insideReasoning) {
-                        sendResponseSseEvent(res, {
-                            type: 'response.output_text.delta',
-                            response_id: responseId,
-                            output_index: 0,
-                            content_index: 0,
-                            delta: '\n</think>\n\n'
-                        });
-                        reasoningText += '\n</think>\n\n';
-                        insideReasoning = false;
-                    }
+                    closeReasoningTag();
 
                     const usage = buildResponsesUsage(fullPromptText, completionText, reasoningText);
 
@@ -1016,7 +1075,7 @@ app.post('/v1/responses', async (req, res) => {
                     });
 
                     const finalResponseEvent = {
-                        type: 'response.completed',
+                        type: status === 'completed' ? 'response.completed' : 'response.incomplete',
                         response: {
                             id: responseId,
                             object: 'response',
@@ -1040,7 +1099,7 @@ app.post('/v1/responses', async (req, res) => {
                     sendResponseSseEvent(res, finalResponseEvent);
 
                     storeResponseState(responseId, {
-                        sessionId: attemptSessionId,
+                        sessionId,
                         model: `${providerId}/${modelId}`
                     });
 
@@ -1049,11 +1108,11 @@ app.post('/v1/responses', async (req, res) => {
                 };
 
                 const failAttempt = (msg) => {
-                    if (ended) return;
-                    ended = true;
+                    if (state.ended) return;
+                    state.ended = true;
                     clearInterval(keepaliveInterval);
                     if (res.destroyed) return;
-                    if (streamedAnything) {
+                    if (state.streamedAnything) {
                         // can't retry after content was sent — surface the error
                         writeErrorEvent(msg);
                     } else {
@@ -1061,129 +1120,40 @@ app.post('/v1/responses', async (req, res) => {
                     }
                 };
 
-                try {
-                    let pendingNext = eventIterator.next();
-                    while (!res.destroyed && !ended) {
-                        const pollTimeout = new Promise(resolve => setTimeout(() => resolve({ timeout: true }), 1000));
-                        const eventResult = await Promise.race([pendingNext, pollTimeout]);
-
-                        if (eventResult.timeout) {
-                            if (promptError) {
-                                console.warn('Ending responses stream due to prompt error:', promptError.message);
-                                failAttempt(promptError.message);
-                            }
-                            continue;
-                        }
-
-                        pendingNext = eventIterator.next();
-
-                        if (eventResult.done) break;
-
-                        const event = eventResult.value;
-
-                        if (event.type === 'message.part.updated') {
-                            const { part } = event.properties;
-                            if (part?.sessionID !== attemptSessionId) {
-                                continue;
-                            }
-                            if (part?.id && part?.type) partTypes.set(part.id, part.type);
-                            continue;
-                        }
-
-                        if (event.type === 'message.part.delta') {
-                            const { sessionID, partID, field, delta } = event.properties;
-                            if (sessionID !== attemptSessionId || field !== 'text' || !delta) {
-                                continue;
-                            }
-                            const partType = partTypes.get(partID) || 'text';
-
-                            if (partType === 'reasoning') {
-                                if (!insideReasoning) {
-                                    sendResponseSseEvent(res, {
-                                        type: 'response.output_text.delta',
-                                        response_id: responseId,
-                                        output_index: 0,
-                                        content_index: 0,
-                                        delta: '<think>\n'
-                                    });
-                                    reasoningText += '<think>\n';
-                                    insideReasoning = true;
-                                }
-
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta
-                                });
-                                reasoningText += delta;
-                                streamedAnything = true;
-                            } else {
-                                if (insideReasoning) {
-                                    sendResponseSseEvent(res, {
-                                        type: 'response.output_text.delta',
-                                        response_id: responseId,
-                                        output_index: 0,
-                                        content_index: 0,
-                                        delta: '\n</think>\n\n'
-                                    });
-                                    reasoningText += '\n</think>\n\n';
-                                    insideReasoning = false;
-                                }
-
-                                sendResponseSseEvent(res, {
-                                    type: 'response.output_text.delta',
-                                    response_id: responseId,
-                                    output_index: 0,
-                                    content_index: 0,
-                                    delta
-                                });
-                                completionText += delta;
-                                streamedAnything = true;
-                            }
-                        }
-
-                        if (event.type === 'message.updated') {
-                            const messageInfo = event.properties?.info;
-                            if (messageInfo?.sessionID === attemptSessionId && messageInfo?.finish && messageInfo?.finish !== 'tool-calls') {
-                                finalize(messageInfo.finish === 'stop' ? 'completed' : 'incomplete');
-                                break;
-                            }
-                        }
-
-                        // Session errored (e.g. model not found, provider failure)
-                        if (event.type === 'session.error') {
-                            const props = event.properties;
-                            if (props?.sessionID === attemptSessionId) {
-                                const msg = props?.error?.data?.message || props?.error?.message || 'Session error';
-                                failAttempt(msg);
-                            }
-                        }
-
-                        // Session went idle: terminal signal for our session
-                        if (event.type === 'session.idle') {
-                            if (event.properties?.sessionID === attemptSessionId) {
-                                if (streamedAnything) {
-                                    finalize('completed');
-                                } else {
-                                    failAttempt('Session went idle without producing content');
-                                }
-                            }
-                        }
+                // Process events (poll so prompt failures never hang the stream).
+                // The shared consumer reconstructs deltas from cumulative
+                // part.text, suppresses the user's echoed parts, and closes the
+                // SSE subscription when the attempt ends.
+                await consumeStreamEvents({
+                    eventIterator,
+                    sessionId,
+                    res,
+                    state,
+                    getPromptError: () => promptError,
+                    onFinish: (finish) => finalize(finish === 'stop' ? 'completed' : 'incomplete'),
+                    onFail: (msg) => failAttempt(msg),
+                    onReasoningStart: () => {
+                        sendTextDelta('<think>\n');
+                        reasoningText += '<think>\n';
+                    },
+                    onReasoningDelta: (delta) => {
+                        sendTextDelta(delta);
+                        reasoningText += delta;
+                    },
+                    onReasoningEnd: () => closeReasoningTag(),
+                    onTextDelta: (delta) => {
+                        sendTextDelta(delta);
+                        completionText += delta;
                     }
-                } catch (streamError) {
-                    console.error('Responses streaming error:', streamError);
-                    failAttempt(streamError.message);
-                }
+                });
 
                 clearInterval(keepaliveInterval);
 
-                if (!ended) {
+                if (!state.ended) {
                     failAttempt(promptError?.message || 'Stream ended unexpectedly');
                 }
 
-                if (ended && streamedAnything) {
+                if (state.ended && state.streamedAnything) {
                     break;
                 }
 
@@ -1202,19 +1172,16 @@ app.post('/v1/responses', async (req, res) => {
             return;
         }
 
-        const REFUSAL_PATTERN = /ready|what would you (like|do|work on)|nothing to do|no request|no task|can'?t see|help\s+with/i;
         const MAX_ATTEMPTS = 3;
         const ATTEMPT_TIMEOUT_MS = 90000;
         let responseData = null;
         let lastError = null;
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            const attemptSession = await client.session.create();
-            const attemptSessionId = attemptSession.data?.id;
-            if (!attemptSessionId) throw new Error('Failed to create session');
-
+            // Reuse the (continuation) session on every attempt so retries
+            // never lose conversation history for previous_response_id.
             const attemptPromise = client.session.prompt({
-                path: { id: attemptSessionId },
+                path: { id: sessionId },
                 body: {
                     model: {
                         providerID: providerId,
@@ -1225,9 +1192,10 @@ app.post('/v1/responses', async (req, res) => {
                     parts: allParts
                 }
             });
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error(`Attempt ${attempt} timed out after ${ATTEMPT_TIMEOUT_MS / 1000}s`)), ATTEMPT_TIMEOUT_MS)
-            );
+            let timeoutHandle;
+            const timeoutPromise = new Promise((_, reject) => {
+                timeoutHandle = setTimeout(() => reject(new Error(`Attempt ${attempt} timed out after ${ATTEMPT_TIMEOUT_MS / 1000}s`)), ATTEMPT_TIMEOUT_MS);
+            });
 
             let responseRes;
             try {
@@ -1237,6 +1205,8 @@ app.post('/v1/responses', async (req, res) => {
                 console.warn(`Responses attempt ${attempt}/${MAX_ATTEMPTS} failed:`, e.message);
                 if (attempt >= MAX_ATTEMPTS) break;
                 continue;
+            } finally {
+                clearTimeout(timeoutHandle);
             }
 
             if (responseRes?.response?.status >= 400) {

@@ -417,4 +417,136 @@ describe('Proxy OpenAI API', () => {
 
         expect(res.statusCode).toEqual(200);
     });
+
+    test('POST /v1/chat/completions should not end stream on intermediate tool-calls finish', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Let me ' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Let me check the weather' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'tool-calls' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Let me check the weather.' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/big-pickle',
+                messages: [{ role: 'user', content: 'What is the weather?' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('"content":"Let me "');
+        expect(res.text).toContain('"content":"check the weather"');
+        expect(res.text).toContain('"content":"."');
+        expect(res.text).toContain('"finish_reason":"stop"');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/responses should not end stream on intermediate tool-calls finish', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Calling' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'tool-calls' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_text', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Calling tool' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/big-pickle',
+                input: 'Use the weather tool',
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('Calling tool');
+        expect(res.text).toContain('"type":"response.completed"');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/chat/completions should not duplicate content when deltas and cumulative snapshots are both emitted', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_r', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: '' } } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_r', field: 'text', delta: 'Think' } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_r', field: 'text', delta: 'ing' } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_r', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: 'Thinking' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_t', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: '' } } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_t', field: 'text', delta: 'Answer' } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_t', field: 'text', delta: '!' } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_t', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Answer!' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/big-pickle',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect((res.text.match(/Think/g) || []).length).toEqual(1);
+        expect((res.text.match(/Answer/g) || []).length).toEqual(1);
+        expect(res.text).toContain('<think>');
+        expect(res.text).toContain('</think>');
+        expect(res.text).toContain('data: [DONE]');
+    });
+
+    test('POST /v1/responses should not duplicate content when deltas and cumulative snapshots are both emitted', async () => {
+        const client = createOpencodeClient();
+        const sessionId = 'test-session-id';
+
+        client.event.subscribe.mockImplementationOnce(async () => ({
+            stream: (async function* () {
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_r', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: '' } } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_r', field: 'text', delta: 'Think' } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_r', field: 'text', delta: 'ing' } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_r', messageID: 'msg_assistant', sessionID: sessionId, type: 'reasoning', text: 'Thinking' } } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_t', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: '' } } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_t', field: 'text', delta: 'Answer' } };
+                yield { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'prt_t', field: 'text', delta: '!' } };
+                yield { type: 'message.part.updated', properties: { part: { id: 'prt_t', messageID: 'msg_assistant', sessionID: sessionId, type: 'text', text: 'Answer!' } } };
+                yield { type: 'message.updated', properties: { info: { id: 'msg_assistant', sessionID: sessionId, role: 'assistant', finish: 'stop' } } };
+            })()
+        }));
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-password')
+            .send({
+                model: 'opencode/big-pickle',
+                input: 'Hello',
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const deltaEvents = res.text
+            .split('\n\n')
+            .filter(line => line.includes('response.output_text.delta'))
+            .join('');
+        expect((deltaEvents.match(/Think/g) || []).length).toEqual(1);
+        expect((deltaEvents.match(/Answer/g) || []).length).toEqual(1);
+        expect(res.text).toContain('"type":"response.completed"');
+        expect(res.text).toContain('data: [DONE]');
+    });
 });
